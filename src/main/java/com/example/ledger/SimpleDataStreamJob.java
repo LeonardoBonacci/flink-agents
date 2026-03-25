@@ -10,6 +10,7 @@ import org.apache.flink.agents.api.resource.ResourceDescriptor;
 import org.apache.flink.agents.api.resource.ResourceName;
 import org.apache.flink.agents.api.resource.ResourceType;
 import org.apache.flink.agents.api.tools.Tool;
+import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.typeinfo.BasicTypeInfo;
 import org.apache.flink.api.java.typeutils.RowTypeInfo;
 import org.apache.flink.streaming.api.datastream.DataStream;
@@ -192,7 +193,10 @@ public class SimpleDataStreamJob {
         );
 
         DataStream<Row> transactions = env
-                .addSource(new WebSocketTransactionSource(8765))
+                .fromSource(
+                        new WebSocketTransactionSource(8765),
+                        WatermarkStrategy.noWatermarks(),
+                        "WebSocket Transactions")
                 .returns(inputSchema);
 
         // 7. Send ALL transactions to the agent — it handles balance + geo checks via tools
