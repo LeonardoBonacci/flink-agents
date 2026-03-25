@@ -47,20 +47,17 @@
             <version>${log4j.version}</version>
         </dependency>
 
-        <!--
-            Flink Agents dependencies — uncomment when ready to integrate agents:
-
-            <dependency>
-                <groupId>org.apache.flink</groupId>
-                <artifactId>flink-agents-api</artifactId>
-                <version>${flink-agents.version}</version>
-            </dependency>
-            <dependency>
-                <groupId>org.apache.flink</groupId>
-                <artifactId>flink-agents-ide-support</artifactId>
-                <version>${flink-agents.version}</version>
-            </dependency>
-        -->
+        <!-- Flink Agents -->
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-agents-api</artifactId>
+            <version>${flink-agents.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.flink</groupId>
+            <artifactId>flink-agents-ide-support</artifactId>
+            <version>${flink-agents.version}</version>
+        </dependency>
     </dependencies>
 
     <build>
