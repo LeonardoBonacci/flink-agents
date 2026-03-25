@@ -114,7 +114,7 @@ public class SimpleDataStreamJob {
                 ResourceDescriptor.Builder
                         .newBuilder(ResourceName.ChatModel.OLLAMA_SETUP)
                         .addInitialArgument("connection", "ollamaConnection")
-                        .addInitialArgument("model", "llama3.1")
+                        .addInitialArgument("model", "qwen3:8b")
                         .addInitialArgument("tools",
                                 Collections.singletonList("notifyShippingManager"))
                         .addInitialArgument("extractReasoning", true)
