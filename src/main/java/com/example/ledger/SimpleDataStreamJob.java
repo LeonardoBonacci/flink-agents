@@ -1,4 +1,4 @@
-package com.example.flink;
+package com.example.ledger;
 
 import org.apache.flink.agents.api.AgentsExecutionEnvironment;
 import org.apache.flink.agents.api.agents.ReActAgent;

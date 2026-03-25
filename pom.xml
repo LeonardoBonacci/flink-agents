@@ -85,7 +85,7 @@
                         <configuration>
                             <transformers>
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
-                                    <mainClass>com.example.flink.SimpleDataStreamJob</mainClass>
+                                    <mainClass>com.example.ledger.SimpleDataStreamJob</mainClass>
                                 </transformer>
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
                             </transformers>
@@ -114,7 +114,7 @@
                     <arguments>
                         <argument>-classpath</argument>
                         <classpath/>
-                        <argument>com.example.flink.SimpleDataStreamJob</argument>
+                        <argument>com.example.ledger.SimpleDataStreamJob</argument>
                     </arguments>
                 </configuration>
             </plugin>
