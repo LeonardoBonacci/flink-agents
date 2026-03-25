@@ -70,6 +70,7 @@ public class SimpleDataStreamJob {
     public static String getGeoFraudScore(
             @ToolParam(description = "The country code to check fraud risk for (e.g. NL, US, NG)")
             String countryCode) {
+        System.out.printf("[TOOL] getGeoFraudScore(%s)%n", countryCode);
         int score = switch (countryCode.toUpperCase()) {
             case "NL" -> 3;
             case "DE" -> 5;
@@ -89,6 +90,7 @@ public class SimpleDataStreamJob {
             @ToolParam(description = "The account ID to check balance for")
             String accountId) {
         double bal = balances.getOrDefault(accountId, 0.0);
+        System.out.printf("[TOOL] getBalance(%s) → %.2f%n", accountId, bal);
         return "{\"accountId\":\"" + accountId + "\",\"balance\":" + bal + "}";
     }
 
@@ -101,6 +103,7 @@ public class SimpleDataStreamJob {
             String amount) {
         double amt = Double.parseDouble(amount);
         double newBal = balances.merge(accountId, amt, Double::sum);
+        System.out.printf("[TOOL] updateBalance(%s, %s) → new balance: %.2f%n", accountId, amount, newBal);
         return "{\"accountId\":\"" + accountId + "\",\"newBalance\":" + newBal + "}";
     }
 
@@ -174,13 +177,13 @@ public class SimpleDataStreamJob {
                         .addInitialArgument("model", "qwen3:8b")
                         .addInitialArgument("tools",
                                 Arrays.asList("getBalance", "getGeoFraudScore", "updateBalance"))
-                        .addInitialArgument("extractReasoning", true)
+                        .addInitialArgument("extractReasoning", false)
                         .build(),
                 prompt,
                 outputSchema
         );
 
-        // 6. Source — WebSocket server on port 8765 (client sends transactions)
+        // 6. Source — HTTP/SSE server on port 8765 (client POSTs transactions, receives verdicts via SSE)
         RowTypeInfo inputSchema = new RowTypeInfo(
                 new org.apache.flink.api.common.typeinfo.TypeInformation<?>[]{
                         BasicTypeInfo.STRING_TYPE_INFO,
@@ -194,35 +197,44 @@ public class SimpleDataStreamJob {
 
         DataStream<Row> transactions = env
                 .fromSource(
-                        new WebSocketTransactionSource(8765),
+                        new SseTransactionSource(8765),
                         WatermarkStrategy.noWatermarks(),
-                        "WebSocket Transactions")
+                        "HTTP/SSE Transactions")
                 .returns(inputSchema);
+
+        // Log incoming transactions
+        DataStream<Row> loggedTransactions = transactions.map(row -> {
+            System.out.printf("[IN]  %s | %s → %s | %s EUR | country=%s%n",
+                    row.getField("txId"), row.getField("fromAccountId"),
+                    row.getField("toAccountId"), row.getField("amount"),
+                    row.getField("merchantCountry"));
+            return row;
+        }).returns(inputSchema);
 
         // 7. Send ALL transactions to the agent — it handles balance + geo checks via tools
         @SuppressWarnings("unchecked")
         DataStream<Row> verdicts = (DataStream<Row>) (DataStream<?>)
                 agentsEnv
-                        .fromDataStream(transactions)
+                        .fromDataStream(loggedTransactions)
                         .apply(agent)
                         .toDataStream();
 
+        // Log agent verdicts
+        DataStream<Row> loggedVerdicts = verdicts.map(row -> {
+            System.out.printf("[OUT] %s | %s → %s | %s EUR | approved=%s | %s%n",
+                    row.getField("txId"), row.getField("fromAccountId"),
+                    row.getField("toAccountId"), row.getField("amount"),
+                    row.getField("approved"), row.getField("reason"));
+            return row;
+        }).returns(outputSchema);
+
         // 8. Split agent verdicts into approved / rejected
-        DataStream<Row> approved = verdicts.filter(row -> (Boolean) row.getField("approved"));
-        DataStream<Row> rejected = verdicts.filter(row -> !(Boolean) row.getField("approved"));
+        DataStream<Row> approved = loggedVerdicts.filter(row -> (Boolean) row.getField("approved"));
+        DataStream<Row> rejected = loggedVerdicts.filter(row -> !(Boolean) row.getField("approved"));
 
-        // 9. Print results
-        approved.map(row -> String.format("✓ %s | %s → %s | %s EUR | %s",
-                row.getField("txId"), row.getField("fromAccountId"),
-                row.getField("toAccountId"), row.getField("amount"),
-                row.getField("reason"))
-        ).returns(BasicTypeInfo.STRING_TYPE_INFO).print("APPROVED ");
-
-        rejected.map(row -> String.format("✗ %s | %s → %s | %s EUR | %s",
-                row.getField("txId"), row.getField("fromAccountId"),
-                row.getField("toAccountId"), row.getField("amount"),
-                row.getField("reason"))
-        ).returns(BasicTypeInfo.STRING_TYPE_INFO).print("REJECTED ");
+        // 9. Send results back to client via SSE
+        approved.sinkTo(new SseVerdictSink("✓ APPROVED"));
+        rejected.sinkTo(new SseVerdictSink("✗ REJECTED"));
 
         // 12. Execute
         agentsEnv.execute();

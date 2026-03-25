@@ -1,48 +1,42 @@
 # Flink Agents POC
 
-A proof-of-concept project for building agentic AI applications with [Apache Flink](https://flink.apache.org/) and [Flink Agents](https://nightlies.apache.org/flink/flink-agents-docs-release-0.2/).
+A proof-of-concept: a ReAct agent pipeline that validates bank transactions for fraud using balance tracking and geo-risk scoring, powered by [Apache Flink](https://flink.apache.org/) and [Flink Agents](https://nightlies.apache.org/flink/flink-agents-docs-release-0.2/).
 
-Currently runs a simple embedded DataStream word-count pipeline. The project is structured to be extended with Flink Agents 0.2 (ReAct agents, tools, LLM integration).
+A WebSocket client sends transactions, the Flink agent investigates each one (balance check, geo fraud score, ledger updates via tools), and streams verdicts back to the client.
 
 ## Prerequisites
 
-- Java 11+
+- Java 21+
 - Maven 3+
+- Ollama running locally: `ollama serve`
+- Model pulled: `ollama pull qwen3:8b`
 
 ## Project Structure
 
 ```
-flink-agents/
-├── pom.xml                                          # Maven config (Flink 2.2.0, agents deps ready)
-└── src/main/
-    ├── java/com/example/flink/
-    │   └── SimpleDataStreamJob.java                 # Embedded DataStream word-count pipeline
-    └── resources/
-        └── log4j2.properties                        # Logging config
+src/main/java/com/example/
+├── ledger/
+│   ├── SimpleDataStreamJob.java         # Flink agent pipeline (main class)
+│   ├── WebSocketTransactionSource.java  # FLIP-27 Source: WS server on port 8765
+│   └── WebSocketVerdictSink.java        # Sink: broadcasts verdicts back via WS
+└── client/
+    └── ClientApp.java                   # WS client: sends transactions, receives verdicts
 ```
 
 ## Running
 
-No external Flink cluster needed — the app runs embedded using Flink's mini-cluster.
-
-### Quick iteration
+### Terminal 1 — Start the Flink agent pipeline
 
 ```bash
 mvn compile exec:exec -q
 ```
 
-### Fat jar
+Starts the WebSocket server on `ws://localhost:8765` and waits for transactions.
+
+### Terminal 2 — Run the client
 
 ```bash
-mvn package -q
-java -jar target/flink-agents-poc-1.0-SNAPSHOT.jar
+java -cp "target/classes:$(mvn dependency:build-classpath -q -DincludeScope=compile -Dmdep.outputFile=/dev/stdout)" com.example.client.ClientApp
 ```
 
-## Next Steps
-
-The Flink Agents dependencies (`flink-agents-api`, `flink-agents-ide-support`) are pre-configured in `pom.xml` (commented out). To start building agents:
-
-1. Uncomment the agents dependencies in `pom.xml`
-2. Wrap `StreamExecutionEnvironment` with `AgentsExecutionEnvironment`
-3. Add chat model connections and tools to the agents environment
-4. Replace map/flatMap operators with agent `.apply()` calls
+Sends 2 transactions, waits for verdicts, then exits.

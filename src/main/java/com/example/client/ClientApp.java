@@ -1,21 +1,26 @@
 package com.example.client;
 
-import org.java_websocket.client.WebSocketClient;
-import org.java_websocket.handshake.ServerHandshake;
-
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 
 /**
- * WebSocket client that sends transactions to the Flink agent pipeline.
+ * HTTP/SSE client that sends transactions via POST and receives
+ * verdict results (approved/rejected) back via Server-Sent Events.
  *
- * <p>Start the Flink job first ({@code mvn compile exec:exec -q}),
- * then run this client in a second terminal:
- * <pre>
- *   mvn compile exec:exec -Dexec.arguments="-classpath %classpath com.example.client.ClientApp" -q
- * </pre>
+ * <ul>
+ *   <li>POST /transactions — send pipe-delimited transactions</li>
+ *   <li>GET  /events       — receive verdicts as SSE data events</li>
+ * </ul>
  */
 public class ClientApp {
+
+    private static final String BASE_URL = "http://localhost:8765";
 
     // Transactions: txId|fromAccountId|toAccountId|amount|merchantCountry
     private static final List<String> TRANSACTIONS = List.of(
@@ -24,39 +29,70 @@ public class ClientApp {
     );
 
     public static void main(String[] args) throws Exception {
-        URI serverUri = new URI("ws://localhost:8765");
+        int expectedVerdicts = TRANSACTIONS.size();
+        CountDownLatch latch = new CountDownLatch(expectedVerdicts);
 
-        WebSocketClient client = new WebSocketClient(serverUri) {
-            @Override
-            public void onOpen(ServerHandshake handshake) {
-                System.out.println("Connected to Flink agent pipeline.");
-                for (String tx : TRANSACTIONS) {
-                    System.out.println("  → " + tx);
-                    send(tx);
+        // 1. Start SSE listener in a background thread
+        Thread sseThread = new Thread(() -> {
+            try {
+                HttpURLConnection conn = (HttpURLConnection)
+                        URI.create(BASE_URL + "/events").toURL().openConnection();
+                conn.setRequestProperty("Accept", "text/event-stream");
+                conn.setRequestProperty("Cache-Control", "no-cache");
+                conn.setConnectTimeout(5000);
+                conn.setReadTimeout(0); // no read timeout — SSE stream stays open
+
+                BufferedReader reader = new BufferedReader(
+                        new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8));
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    if (line.startsWith("data: ")) {
+                        System.out.println("  ← " + line.substring(6));
+                        latch.countDown();
+                    }
                 }
-                System.out.println("All transactions sent. Sending DONE.");
-                send("DONE");
+            } catch (Exception e) {
+                if (latch.getCount() > 0) {
+                    e.printStackTrace();
+                }
             }
+        }, "sse-listener");
+        sseThread.setDaemon(true);
+        sseThread.start();
 
-            @Override
-            public void onMessage(String message) {
-                System.out.println("← " + message);
-            }
+        // Give SSE connection time to establish
+        Thread.sleep(500);
 
-            @Override
-            public void onClose(int code, String reason, boolean remote) {
-                System.out.println("Connection closed.");
-            }
+        System.out.println("Connected to Flink agent pipeline.\n");
+        System.out.println("Sending " + TRANSACTIONS.size() + " transactions:");
 
-            @Override
-            public void onError(Exception ex) {
-                ex.printStackTrace();
-            }
-        };
+        // 2. POST each transaction
+        for (String tx : TRANSACTIONS) {
+            System.out.println("  → " + tx);
+            post(BASE_URL + "/transactions", tx);
+        }
 
-        client.connectBlocking();
-        // Give the server a moment to process the DONE signal
-        Thread.sleep(1000);
-        client.closeBlocking();
+        System.out.println("\nWaiting for verdicts...\n");
+
+        // 3. Wait for all verdicts via SSE
+        latch.await();
+        System.out.println("\nAll verdicts received.");
+
+        // 4. Signal DONE
+        post(BASE_URL + "/transactions", "DONE");
+        Thread.sleep(500);
+    }
+
+    private static void post(String url, String body) throws Exception {
+        HttpURLConnection conn = (HttpURLConnection)
+                URI.create(url).toURL().openConnection();
+        conn.setRequestMethod("POST");
+        conn.setDoOutput(true);
+        conn.setRequestProperty("Content-Type", "text/plain");
+        try (OutputStream os = conn.getOutputStream()) {
+            os.write(body.getBytes(StandardCharsets.UTF_8));
+        }
+        conn.getResponseCode(); // wait for response
+        conn.disconnect();
     }
 }
