@@ -17,6 +17,8 @@ import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.types.Row;
 
 import java.util.Arrays;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Transaction Fraud Validator — ReAct Agent with investigation tools.
@@ -25,6 +27,9 @@ import java.util.Arrays;
  * tools to gather evidence (geo fraud score, account balance). The agent
  * outputs a structured verdict (approved/rejected + reason), and downstream
  * Flink operators split the stream deterministically.
+ *
+ * <p>Balances are tracked in a shared ledger. Approved transactions deduct
+ * from the ledger, so subsequent balance checks reflect prior spending.
  *
  * <p>Prerequisites:
  * <ul>
@@ -36,6 +41,16 @@ import java.util.Arrays;
  */
 public class SimpleDataStreamJob {
 
+    // ── Balance Ledger ────────────────────────────────────────────────────
+
+    /** Shared ledger — simulates an external balance service. All accounts start at 1000 EUR. */
+    private static final Map<String, Double> LEDGER = new ConcurrentHashMap<>(Map.of(
+            "ACC-001", 1000.0,
+            "ACC-002", 1000.0,
+            "ACC-003", 1000.0,
+            "ACC-004", 1000.0
+    ));
+
     // ── Prompt ────────────────────────────────────────────────────────────
 
     private static final String SYSTEM_PROMPT =
@@ -44,12 +59,14 @@ public class SimpleDataStreamJob {
             + "You have two tools:\n"
             + "- getGeoFraudScore: returns a fraud risk percentage (0-100) for a country. "
             + "Scores above 70 are high risk.\n"
-            + "- checkAccountBalance: returns the current account balance.\n\n"
+            + "- checkAccountBalance: returns the current account balance in EUR.\n\n"
             + "Use these tools to gather evidence, then decide:\n"
             + "- APPROVE if the geo fraud score is acceptable AND the account has sufficient funds.\n"
             + "- REJECT if the geo fraud score is too high OR insufficient funds, and explain why.\n\n"
+            + "IMPORTANT: You must echo back the accountId and amount exactly as given in the input.\n\n"
             + "Ensure your response can be parsed as JSON, using this exact format:\n"
-            + "{\"txId\": \"TX001\", \"approved\": true, \"reason\": \"low risk, sufficient funds\"}";
+            + "{\"txId\": \"TX-001\", \"accountId\": \"ACC-001\", \"amount\": \"250.00\", "
+            + "\"approved\": true, \"reason\": \"low risk, sufficient funds\"}";
 
     // ── Tools ─────────────────────────────────────────────────────────────
 
@@ -71,20 +88,14 @@ public class SimpleDataStreamJob {
                 + "\",\"fraudScore\":" + score + "}";
     }
 
-    /** Returns the current account balance for the given account ID. */
+    /** Returns the current account balance from the shared ledger. */
     @org.apache.flink.agents.api.annotation.Tool
     public static String checkAccountBalance(
             @ToolParam(description = "The account ID to check the balance for")
             String accountId) {
-        double balance = switch (accountId) {
-            case "ACC-001" -> 15_240.50;
-            case "ACC-002" -> 342.10;
-            case "ACC-003" -> 89_500.00;
-            case "ACC-004" -> 1_200.75;
-            default        -> 0.0;
-        };
+        double balance = LEDGER.getOrDefault(accountId, 0.0);
         return "{\"accountId\":\"" + accountId
-                + "\",\"balance\":" + balance + "}";
+                + "\",\"balance\":" + String.format("%.2f", balance) + "}";
     }
 
     // ── Main ──────────────────────────────────────────────────────────────
@@ -94,6 +105,7 @@ public class SimpleDataStreamJob {
         // 1. Create Flink + Agents execution environments
         final StreamExecutionEnvironment env =
                 StreamExecutionEnvironment.getExecutionEnvironment();
+        env.setParallelism(1); // sequential processing so balance updates are visible
         final AgentsExecutionEnvironment agentsEnv =
                 AgentsExecutionEnvironment.getExecutionEnvironment(env);
 
@@ -128,14 +140,16 @@ public class SimpleDataStreamJob {
                         + "transfer {amount} EUR to {merchantCountry}.")
         ));
 
-        // 4. Output schema — the agent's verdict
+        // 4. Output schema — verdict with accountId + amount for downstream balance tracking
         RowTypeInfo outputSchema = new RowTypeInfo(
                 new org.apache.flink.api.common.typeinfo.TypeInformation<?>[]{
+                        BasicTypeInfo.STRING_TYPE_INFO,
+                        BasicTypeInfo.STRING_TYPE_INFO,
                         BasicTypeInfo.STRING_TYPE_INFO,
                         BasicTypeInfo.BOOLEAN_TYPE_INFO,
                         BasicTypeInfo.STRING_TYPE_INFO
                 },
-                new String[]{"txId", "approved", "reason"}
+                new String[]{"txId", "accountId", "amount", "approved", "reason"}
         );
 
         // 5. Create ReAct Agent
@@ -152,7 +166,8 @@ public class SimpleDataStreamJob {
                 outputSchema
         );
 
-        // 6. Source — sample transactions: Row(txId, accountId, amount, merchantCountry)
+        // 6. Source — sample transactions that will drain account balances
+        //    All accounts start at 1000 EUR
         RowTypeInfo inputSchema = new RowTypeInfo(
                 new org.apache.flink.api.common.typeinfo.TypeInformation<?>[]{
                         BasicTypeInfo.STRING_TYPE_INFO,
@@ -164,10 +179,14 @@ public class SimpleDataStreamJob {
         );
 
         DataStream<Row> transactions = env.fromData(
-                Row.of("TX-001", "ACC-001", "250.00",    "NL"),   // low risk, plenty of funds
-                Row.of("TX-002", "ACC-002", "8000.00",   "NG"),   // high risk country + insufficient funds
-                Row.of("TX-003", "ACC-003", "12000.00",  "DE"),   // low risk, sufficient funds
-                Row.of("TX-004", "ACC-004", "5000.00",   "KP")    // very high risk country
+                Row.of("TX-001", "ACC-001", "400.00",  "NL"),  // approve → bal 600
+                Row.of("TX-002", "ACC-002", "500.00",  "DE"),  // approve → bal 500
+                Row.of("TX-003", "ACC-001", "350.00",  "NL"),  // approve → bal 250
+                Row.of("TX-004", "ACC-003", "200.00",  "US"),  // approve → bal 800
+                Row.of("TX-005", "ACC-001", "500.00",  "NL"),  // REJECT — only 250 left
+                Row.of("TX-006", "ACC-002", "600.00",  "NL"),  // REJECT — only 500 left
+                Row.of("TX-007", "ACC-004", "150.00",  "RU"),  // REJECT — geo 78 (high risk)
+                Row.of("TX-008", "ACC-003", "900.00",  "KP")   // REJECT — geo 97 + only 800 left
         ).returns(inputSchema);
 
         // 7. Apply agent to stream
@@ -182,10 +201,21 @@ public class SimpleDataStreamJob {
         DataStream<Row> approved = verdicts.filter(row -> (Boolean) row.getField("approved"));
         DataStream<Row> rejected = verdicts.filter(row -> !(Boolean) row.getField("approved"));
 
-        approved.print("APPROVED");
-        rejected.print("REJECTED");
+        // 9. Approved → deduct from ledger, print new balance
+        approved.map(row -> {
+            String accountId = (String) row.getField("accountId");
+            double amount = Double.parseDouble((String) row.getField("amount"));
+            double newBalance = LEDGER.compute(accountId, (k, bal) -> bal - amount);
+            return String.format("✓ %s | %s | -%.2f EUR | new balance: %.2f EUR",
+                    row.getField("txId"), accountId, amount, newBalance);
+        }).returns(BasicTypeInfo.STRING_TYPE_INFO).print("PROCESSED");
 
-        // 9. Execute
+        rejected.map(row -> String.format("✗ %s | %s | %s EUR | %s",
+                row.getField("txId"), row.getField("accountId"),
+                row.getField("amount"), row.getField("reason"))
+        ).returns(BasicTypeInfo.STRING_TYPE_INFO).print("REJECTED ");
+
+        // 10. Execute
         agentsEnv.execute();
     }
 }
