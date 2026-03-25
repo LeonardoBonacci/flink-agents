@@ -97,8 +97,9 @@ public class SimpleDataStreamJob {
             @ToolParam(description = "The account ID to update")
             String accountId,
             @ToolParam(description = "Amount to add (negative to debit, positive to credit)")
-            double amount) {
-        double newBal = balances.merge(accountId, amount, Double::sum);
+            String amount) {
+        double amt = Double.parseDouble(amount);
+        double newBal = balances.merge(accountId, amt, Double::sum);
         return "{\"accountId\":\"" + accountId + "\",\"newBalance\":" + newBal + "}";
     }
 
@@ -140,7 +141,7 @@ public class SimpleDataStreamJob {
                         ResourceType.TOOL,
                         Tool.fromMethod(
                                 SimpleDataStreamJob.class.getMethod(
-                                        "updateBalance", String.class, double.class)));
+                                        "updateBalance", String.class, String.class)));
 
         // 3. Build prompt
         Prompt prompt = Prompt.fromMessages(Arrays.asList(
@@ -178,7 +179,7 @@ public class SimpleDataStreamJob {
                 outputSchema
         );
 
-        // 6. Source — sample transactions (every account starts at 0 EUR, overdraft limit -1000 EUR)
+        // 6. Source — WebSocket server on port 8765 (client sends transactions)
         RowTypeInfo inputSchema = new RowTypeInfo(
                 new org.apache.flink.api.common.typeinfo.TypeInformation<?>[]{
                         BasicTypeInfo.STRING_TYPE_INFO,
@@ -190,16 +191,9 @@ public class SimpleDataStreamJob {
                 new String[]{"txId", "fromAccountId", "toAccountId", "amount", "merchantCountry"}
         );
 
-        DataStream<Row> transactions = env.fromData(
-                Row.of("TX-001", "ACC-001", "ACC-003", "400.00",  "NL"),  // balance OK, geo OK → approve
-                Row.of("TX-002", "ACC-002", "ACC-004", "500.00",  "DE"),  // balance OK, geo OK → approve
-                Row.of("TX-003", "ACC-001", "ACC-005", "350.00",  "NL"),  // balance OK, geo OK → approve (ACC-001: -750)
-                Row.of("TX-004", "ACC-003", "ACC-001", "200.00",  "US"),  // balance OK, geo OK → approve
-                Row.of("TX-005", "ACC-001", "ACC-002", "500.00",  "NL"),  // REJECT balance: -550 - 500 = -1050
-                Row.of("TX-006", "ACC-002", "ACC-001", "600.00",  "NL"),  // REJECT balance: -500 - 600 = -1100
-                Row.of("TX-007", "ACC-004", "ACC-001", "150.00",  "RU"),  // balance OK, REJECT geo: 78
-                Row.of("TX-008", "ACC-003", "ACC-002", "900.00",  "KP")   // balance OK, REJECT geo: 97
-        ).returns(inputSchema);
+        DataStream<Row> transactions = env
+                .addSource(new WebSocketTransactionSource(8765))
+                .returns(inputSchema);
 
         // 7. Send ALL transactions to the agent — it handles balance + geo checks via tools
         @SuppressWarnings("unchecked")

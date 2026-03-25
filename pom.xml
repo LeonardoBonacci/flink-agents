@@ -47,6 +47,13 @@
             <version>${log4j.version}</version>
         </dependency>
 
+        <!-- WebSocket -->
+        <dependency>
+            <groupId>org.java-websocket</groupId>
+            <artifactId>Java-WebSocket</artifactId>
+            <version>1.6.0</version>
+        </dependency>
+
         <!-- Flink Agents -->
         <dependency>
             <groupId>org.apache.flink</groupId>
