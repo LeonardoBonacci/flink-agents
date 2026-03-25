@@ -17,14 +17,14 @@ import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.types.Row;
 
 import java.util.Arrays;
-import java.util.Collections;
 
 /**
- * ReAct Agent example — Review Analysis.
+ * Transaction Fraud Validator — ReAct Agent with investigation tools.
  *
- * <p>Mirrors the Python quickstart from the Flink Agents 0.2 docs, translated
- * to the Java API. Reads a bounded stream of product reviews, sends each to a
- * ReAct agent backed by Ollama (qwen3:8b), and prints the analysis result.
+ * <p>Each incoming transaction is investigated by a ReAct agent that can call
+ * tools to gather evidence (geo fraud score, account balance). The agent
+ * outputs a structured verdict (approved/rejected + reason), and downstream
+ * Flink operators split the stream deterministically.
  *
  * <p>Prerequisites:
  * <ul>
@@ -39,29 +39,52 @@ public class SimpleDataStreamJob {
     // ── Prompt ────────────────────────────────────────────────────────────
 
     private static final String SYSTEM_PROMPT =
-            "Analyze the user review and product information to determine a "
-            + "satisfaction score (1-5) and potential reasons for dissatisfaction.\n\n"
-            + "If the review mentions shipping damage, call the notifyShippingManager "
-            + "tool with the product id and review text.\n\n"
-            + "Example input format:\n"
-            + "{\"id\": \"12345\", \"review\": \"The headphones broke after one week.\"}\n\n"
+            "You are a bank transaction fraud validator. For each transaction, "
+            + "investigate whether it should be approved or rejected.\n\n"
+            + "You have two tools:\n"
+            + "- getGeoFraudScore: returns a fraud risk percentage (0-100) for a country. "
+            + "Scores above 70 are high risk.\n"
+            + "- checkAccountBalance: returns the current account balance.\n\n"
+            + "Use these tools to gather evidence, then decide:\n"
+            + "- APPROVE if the geo fraud score is acceptable AND the account has sufficient funds.\n"
+            + "- REJECT if the geo fraud score is too high OR insufficient funds, and explain why.\n\n"
             + "Ensure your response can be parsed as JSON, using this exact format:\n"
-            + "{\"id\": \"12345\", \"score\": 1, \"reasons\": [\"poor quality\"]}";
+            + "{\"txId\": \"TX001\", \"approved\": true, \"reason\": \"low risk, sufficient funds\"}";
 
-    // ── Tool ──────────────────────────────────────────────────────────────
+    // ── Tools ─────────────────────────────────────────────────────────────
 
-    /**
-     * Notify the shipping manager when a product received a negative review
-     * due to shipping damage.
-     */
+    /** Returns a geo-location fraud risk score (0-100) for the given country. */
     @org.apache.flink.agents.api.annotation.Tool
-    public static String notifyShippingManager(
-            @ToolParam(description = "The id of the product that received a negative review due to shipping damage")
-            String id,
-            @ToolParam(description = "The negative review content")
-            String review) {
-        System.out.println("[NOTIFICATION] Shipping manager notified for product " + id + ": " + review);
-        return "Shipping manager has been notified for product " + id;
+    public static String getGeoFraudScore(
+            @ToolParam(description = "The country code to check fraud risk for (e.g. NL, US, NG)")
+            String countryCode) {
+        int score = switch (countryCode.toUpperCase()) {
+            case "NL" -> 3;
+            case "DE" -> 5;
+            case "US" -> 12;
+            case "RU" -> 78;
+            case "NG" -> 85;
+            case "KP" -> 97;
+            default   -> 50;
+        };
+        return "{\"countryCode\":\"" + countryCode.toUpperCase()
+                + "\",\"fraudScore\":" + score + "}";
+    }
+
+    /** Returns the current account balance for the given account ID. */
+    @org.apache.flink.agents.api.annotation.Tool
+    public static String checkAccountBalance(
+            @ToolParam(description = "The account ID to check the balance for")
+            String accountId) {
+        double balance = switch (accountId) {
+            case "ACC-001" -> 15_240.50;
+            case "ACC-002" -> 342.10;
+            case "ACC-003" -> 89_500.00;
+            case "ACC-004" -> 1_200.75;
+            default        -> 0.0;
+        };
+        return "{\"accountId\":\"" + accountId
+                + "\",\"balance\":" + balance + "}";
     }
 
     // ── Main ──────────────────────────────────────────────────────────────
@@ -74,7 +97,7 @@ public class SimpleDataStreamJob {
         final AgentsExecutionEnvironment agentsEnv =
                 AgentsExecutionEnvironment.getExecutionEnvironment(env);
 
-        // 2. Register resources: Ollama connection + tool
+        // 2. Register resources: Ollama connection + investigation tools
         agentsEnv
                 .addResource(
                         "ollamaConnection",
@@ -85,28 +108,34 @@ public class SimpleDataStreamJob {
                                 .addInitialArgument("requestTimeout", 120)
                                 .build())
                 .addResource(
-                        "notifyShippingManager",
+                        "getGeoFraudScore",
                         ResourceType.TOOL,
                         Tool.fromMethod(
                                 SimpleDataStreamJob.class.getMethod(
-                                        "notifyShippingManager",
-                                        String.class, String.class)));
+                                        "getGeoFraudScore", String.class)))
+                .addResource(
+                        "checkAccountBalance",
+                        ResourceType.TOOL,
+                        Tool.fromMethod(
+                                SimpleDataStreamJob.class.getMethod(
+                                        "checkAccountBalance", String.class)));
 
-        // 3. Build prompt (system instructions + user input template)
+        // 3. Build prompt
         Prompt prompt = Prompt.fromMessages(Arrays.asList(
                 new ChatMessage(MessageRole.SYSTEM, SYSTEM_PROMPT),
                 new ChatMessage(MessageRole.USER,
-                        "\"id\": \"{id}\",\n\"review\": \"{review}\"")
+                        "Transaction {txId}: account {accountId} wants to "
+                        + "transfer {amount} EUR to {merchantCountry}.")
         ));
 
-        // 4. Define output schema
+        // 4. Output schema — the agent's verdict
         RowTypeInfo outputSchema = new RowTypeInfo(
                 new org.apache.flink.api.common.typeinfo.TypeInformation<?>[]{
                         BasicTypeInfo.STRING_TYPE_INFO,
-                        BasicTypeInfo.INT_TYPE_INFO,
+                        BasicTypeInfo.BOOLEAN_TYPE_INFO,
                         BasicTypeInfo.STRING_TYPE_INFO
                 },
-                new String[]{"id", "score", "reasons"}
+                new String[]{"txId", "approved", "reason"}
         );
 
         // 5. Create ReAct Agent
@@ -116,38 +145,47 @@ public class SimpleDataStreamJob {
                         .addInitialArgument("connection", "ollamaConnection")
                         .addInitialArgument("model", "qwen3:8b")
                         .addInitialArgument("tools",
-                                Collections.singletonList("notifyShippingManager"))
+                                Arrays.asList("getGeoFraudScore", "checkAccountBalance"))
                         .addInitialArgument("extractReasoning", true)
                         .build(),
                 prompt,
                 outputSchema
         );
 
-        // 6. Source — sample product reviews as Row(id, review)
+        // 6. Source — sample transactions: Row(txId, accountId, amount, merchantCountry)
         RowTypeInfo inputSchema = new RowTypeInfo(
                 new org.apache.flink.api.common.typeinfo.TypeInformation<?>[]{
                         BasicTypeInfo.STRING_TYPE_INFO,
+                        BasicTypeInfo.STRING_TYPE_INFO,
+                        BasicTypeInfo.STRING_TYPE_INFO,
                         BasicTypeInfo.STRING_TYPE_INFO
                 },
-                new String[]{"id", "review"}
+                new String[]{"txId", "accountId", "amount", "merchantCountry"}
         );
 
-        DataStream<Row> reviews = env.fromData(
-                Row.of("1", "Great product, exactly what I needed!"),
-                Row.of("2", "Product arrived damaged due to poor packaging during shipping."),
-                Row.of("3", "Battery life is terrible, barely lasts 2 hours."),
-                Row.of("4", "Excellent quality and fast delivery, highly recommended.")
+        DataStream<Row> transactions = env.fromData(
+                Row.of("TX-001", "ACC-001", "250.00",    "NL"),   // low risk, plenty of funds
+                Row.of("TX-002", "ACC-002", "8000.00",   "NG"),   // high risk country + insufficient funds
+                Row.of("TX-003", "ACC-003", "12000.00",  "DE"),   // low risk, sufficient funds
+                Row.of("TX-004", "ACC-004", "5000.00",   "KP")    // very high risk country
         ).returns(inputSchema);
 
         // 7. Apply agent to stream
-        DataStream<?> results = agentsEnv
-                .fromDataStream(reviews)
-                .apply(agent)
-                .toDataStream();
+        @SuppressWarnings("unchecked")
+        DataStream<Row> verdicts = (DataStream<Row>) (DataStream<?>)
+                agentsEnv
+                        .fromDataStream(transactions)
+                        .apply(agent)
+                        .toDataStream();
 
-        results.print();
+        // 8. Split into approved / rejected streams
+        DataStream<Row> approved = verdicts.filter(row -> (Boolean) row.getField("approved"));
+        DataStream<Row> rejected = verdicts.filter(row -> !(Boolean) row.getField("approved"));
 
-        // 8. Execute
+        approved.print("APPROVED");
+        rejected.print("REJECTED");
+
+        // 9. Execute
         agentsEnv.execute();
     }
 }
